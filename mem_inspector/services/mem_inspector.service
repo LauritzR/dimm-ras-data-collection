@@ -1,0 +1,12 @@
+[Unit]
+Description=Memory inspector
+
+[Service]
+ExecStart=/usr/bin/python3 /$DIR_HERE/vme/bin/mem_inspector.py
+Environment=PYTHONPATH=/$DIR_HERE/vme
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=file:/var/log/mem_inspector_stdout.log
+StandardError=file:/var/log/mem_inspector_stderr.log
+#Type=notify
+#Restart=on-failure
+

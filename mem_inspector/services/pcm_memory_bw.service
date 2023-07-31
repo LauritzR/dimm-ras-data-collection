@@ -1,0 +1,9 @@
+[Unit]
+Description=PCM Memory BW metrics
+
+[Service]
+ExecStart=/usr/sbin/pcm-memory 2 -csv=/var/log/pcm_memory_bw.csv
+StandardOutput=file:/var/log/pcm_memory_bw_stdout.log
+StandardError=file:/var/log/pcm_memory_bw_stderr.log
+#Type=notify
+#Restart=on-failure
