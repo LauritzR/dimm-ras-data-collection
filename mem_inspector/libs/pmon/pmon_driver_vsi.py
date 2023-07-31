@@ -28,7 +28,7 @@ except ImportError:
     # To overcome problems with importing PMONSIDriver in UnitTests
     # try / except block has been provided.
     # This will be replaced with:
-    #   CEREBRO-2325 Stub vmware.vsi within PMONVSIDriver to exclude try/except block
+    # Stub vmware.vsi within PMONVSIDriver to exclude try/except block
     logger.error(
         "Unable to import vmware library, some of PMON functionality might not work.\n"
         "Try to load another PMON driver."
