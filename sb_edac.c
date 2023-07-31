@@ -3906,5 +3906,5 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mauro Carvalho Chehab");
 MODULE_AUTHOR("Red Hat Inc. (http://www.redhat.com)");
 MODULE_AUTHOR("Shrikanth Malavalli Divakar, SAP SE");
-MODULE_DESCRIPTION("MC Driver for Intel Sandy Bridge and Ivy Bridge memory controllers - SAP CEREBRO"
+MODULE_DESCRIPTION("MC Driver for Intel Sandy Bridge and Ivy Bridge memory controllers"
 		   SBRIDGE_REVISION);
