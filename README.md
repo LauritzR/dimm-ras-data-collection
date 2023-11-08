@@ -1,6 +1,8 @@
 # dimm-ras
 DIMM RAS feature monitoring on Linux servers
 
+This module was developed with the publication ... for data collection to train CNNs for failure risk estimation of memory modules among other things. If you use our work, we are happy if you cite it.
+
 ## Linux kernel module modification
 
 sb_edac.c contains the necessary code to fetch corrected error address on Intel E5 and E7 v4 processors.
