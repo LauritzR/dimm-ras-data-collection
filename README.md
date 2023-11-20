@@ -1,7 +1,7 @@
 # dimm-ras
 DIMM RAS feature monitoring on Linux servers
 
-This tool was developed with the publication ... for data collection to train CNNs for failure risk estimation of memory modules among other things. If you use our work, we are happy if you cite it.
+This tool was developed with the publication https://doi.org/10.1016/j.jpdc.2023.104800 for data collection to train CNNs for failure risk estimation of memory modules among other things. If you use our work, we are happy if you cite it.
 
 ## Linux kernel module modification
 
