@@ -6,11 +6,12 @@ This tool was developed with the publication https://doi.org/10.1016/j.jpdc.2023
 ## Linux kernel module modification
 
 sb_edac.c contains the necessary code to fetch corrected error address on Intel E5 and E7 v4 processors.
-staticint sb_rd_err_log(void *data) has been added for this purpose.
+static int sb_rd_err_log(void *data) has been added for this purpose.
 sb_edac driver is modified to be a poll mode driver (hardcoded to 10ms) instead of depending on MCE interrupt.
 This is a driver to be used with BROADWELL and HASWELL processors. For the recent Skylake onwards, skx_edac.c exists in linux tree.
 The modified driver contains sb_rd_err_log function to poll the RANK level memory counters from the aforementioned processors.
-This approach is necessary when HW vendors disable interrupt delivery to the OS or Hypervisor.
+Although this is not the optimal appraoch, this approach is necessary, could be used for research, when HW vendors disable interrupt delivery to the OS or Hypervisor.
+
 
 ## Compiling the Kernel Module:
 
@@ -34,7 +35,7 @@ make scripts prepare modules_prepare
 
 Run make for desired target. For example: to compile all the network drivers run as below:
 
-make -C . M=drivers/edac/
+make -C . M=drivers/edac
 
 Copy the compiled .ko file to the path where current kernel modules are present.
 
