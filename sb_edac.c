@@ -27,7 +27,7 @@
 #include <linux/cpumask.h>
 #include <linux/kthread.h>
 #include <asm/msr.h>
-
+#include <asm/page.h>
 #include "edac_module.h"
 
 /* Static vars */
@@ -363,7 +363,7 @@ struct sbridge_channel {
 	u32		dimms;
 
 	/*Rank level counters*/
-	u16 prev0,prev1,prev2,prev3,prev4,prev5,prev6,prev7;
+    u16 prev_err[8]; // Array of 8 u16s
 };
 
 struct pci_id_descr {
@@ -3049,229 +3049,130 @@ enodev:
  */
 static int sb_rd_err_log(void *data)
 {
+    u64 msr_status = 0, msr_addr = 0;
+    u32 corr[4];
+    u16 new_err[8], curr_err[8];
+    struct sbridge_dev *sbridge_dev;
+    struct sbridge_pvt *pvt_info;
+    const u16 counter_threshold = 0x7FFF;
+	int i,j;
+    u8 cpu, max_node_id = 0, num_sockets = 0, mc_per_socket = 0;
+    int cpus_per_core, cpus_online, ch, err;
+	bool has_errors = false;
+	
+    // Determine the number of sockets and mc_per_socket
+    list_for_each_entry(sbridge_dev, &sbridge_edac_list, list) {
+        max_node_id = max(max_node_id, sbridge_dev->source_id);
+        if (sbridge_dev->source_id == 0) {
+            mc_per_socket++;
+        }
+    }
+    num_sockets = max_node_id + 1;
+    cpus_online = num_online_cpus();
+    cpus_per_core = cpus_online / (num_sockets * 2); 
 
-	int  err;
-	u64 msr_status=0,msr_addr=0;
-	u32 corr0, corr1, corr2, corr3;
-	u16  new0=0,new1=0,new2=0,new3=0,new4=0,new5=0,new6=0,new7=0;
-	u16  curr0=0,curr1=0,curr2=0,curr3=0,curr4=0,curr5=0,curr6=0,curr7 = 0;
+    sbridge_printk(KERN_INFO, "Sockets: %d, IMCs/socket: %d, CPUs/core: %d\n", num_sockets, mc_per_socket, cpus_per_core);
 
-	struct sbridge_dev *sbridge_dev;
-	struct sbridge_pvt *pvt_info;
-	u16 counter_threshold = 0x7FFF;  // Threshold hard-coded as per HPE servers; could also learn from the counter providing PCI devices' relevant offsets
+    while (!kthread_should_stop()) {
+        list_for_each_entry(sbridge_dev, &sbridge_edac_list, list) {
+            pvt_info = sbridge_dev->mci->pvt_info;
+            for (ch = 0; ch < pvt_info->num_channels; ch++) {
+                if (!pvt_info->pci_cerr[ch]) continue;
 
-	u8 max_node_id = 0, num_sockets=0,mc_per_socket=0;
+                // Read the counters
+                for (i = 0; i < 4; i++) {
+                    pci_read_config_dword(pvt_info->pci_cerr[ch], 0x104 + i * 4, &corr[i]);
+                }
 
-	int cpus_per_core = 0;
-	int threads_per_core = 2;  // on E5 and E7 v4, 2 threads per core available
-	u8 cpu;
-	int cpus_online;
-	int ch;
-	int mc_index;
+                // Process counters
+                for (i = 0; i < 8; i++) {
+                    curr_err[i] = (i % 2 == 0) ? RANK_EVEN_ERR_CNT(corr[i / 2]) : RANK_ODD_ERR_CNT(corr[i / 2]);
+                    new_err[i] = curr_err[i] - pvt_info->channel[ch].prev_err[i];
+                    if (new_err[i] < 0) {
+                        new_err[i] = (counter_threshold - pvt_info->channel[ch].prev_err[i]) + curr_err[i];
+                    }
+                }
 
-	// Determine the number of sockets on this server
-	list_for_each_entry(sbridge_dev, &sbridge_edac_list, list){
-		if(sbridge_dev -> source_id > max_node_id){
-			max_node_id = sbridge_dev -> source_id;
-		}
+                // Log if there are errors
+                has_errors = false;
+                for (i = 0; i < 8; i++) {
+                    if (new_err[i] != 0) {
+                        has_errors = true;
+                        break;
+                    }
+                }
+                if (!has_errors) continue;
 
-		if(sbridge_dev -> source_id == 0){
-    			mc_per_socket++;
-    		}
-	}
+                // Read MSR status - assuming Broadwell type processors.
+				// For Broadwell, as per SDM Volume 3B and as inferred on the servers, Home Agent contains the error address.
 
-	num_sockets = max_node_id + 1;
-	cpus_online = num_online_cpus();		// Logical CPUs currently online/available
-	cpus_per_core = cpus_online/num_sockets;	// Logical CPUs per Socket
-	cpus_per_core = cpus_per_core/threads_per_core;  // Physical Cores per Socket
-
-    	sbridge_printk(KERN_INFO, "Number of sockets on the system %d, Number of IMCs per Socket %d\n", num_sockets,mc_per_socket);
-	sbridge_printk(KERN_INFO, "Num_of online_cpus:%d nr_cpu_ids: %d cpus_per_core: %d\n", num_online_cpus(), nr_cpu_ids, cpus_per_core);
-    
-
-	while(!kthread_should_stop()){
-		// Poll for corrected errors. Pick a CPU per socket to poll MCA registers.
-		// Don't worry about Uncorrected errors. Leave it to MCE subsystem.
-
-
-		list_for_each_entry(sbridge_dev, &sbridge_edac_list, list) {
-		pvt_info = sbridge_dev->mci->pvt_info;
-		for(ch = 0; ch < pvt_info -> num_channels; ch++)
-		{
-			// For each channel on this IMC, get the RANK level counters
-			if(pvt_info->pci_cerr[ch]){
-
-					sbridge_printk(KERN_DEBUG, "Getting counters for PCI device: %02x.%02d.%d\n",
-								  sbridge_dev->bus,PCI_SLOT(pvt_info->pci_cerr[ch]->devfn),PCI_FUNC(pvt_info->pci_cerr[ch]->devfn));
-
-					//Initialize counter variables to zero
-					corr0=0, corr1=0, corr2=0, corr3=0;
-					new0=0, new1=0, new2=0, new3=0, new4=0, new5=0, new6=0, new7=0;
-					curr0=0, curr1=0, curr2=0, curr3=0, curr4=0, curr5=0, curr6=0, curr7 = 0;
-
-					//Read the counters from relevant register. The offset remains the same across processor families.
-					//Only Bus, Device, Function of a PCI device differs.
-					pci_read_config_dword(pvt_info->pci_cerr[ch] , 0x104, &corr0);
-					pci_read_config_dword(pvt_info->pci_cerr[ch] , 0x108, &corr1);
-					pci_read_config_dword(pvt_info->pci_cerr[ch] , 0x10c, &corr2);
-					pci_read_config_dword(pvt_info->pci_cerr[ch] , 0x110, &corr3);
-
-					sbridge_printk(KERN_DEBUG, "Finished reading CE Errors corr0=%d corr1=%d corr2=%d corr3=%d\n",corr0,corr1,corr2,corr3);
-
-					//Fetch the register bits (15 bits) that correspond to RANK level counters
-					curr0 = RANK_EVEN_ERR_CNT(corr0); //RANK 0
-					curr1 = RANK_ODD_ERR_CNT(corr0);  //RANK 1
-
-					curr2 = RANK_EVEN_ERR_CNT(corr1); //RANK 2
-					curr3 = RANK_ODD_ERR_CNT(corr1);  //RANK 3
-
-					curr4 = RANK_EVEN_ERR_CNT(corr2); //RANK 4
-					curr5 = RANK_ODD_ERR_CNT(corr2);  //RANK 5
-
-					curr6 = RANK_EVEN_ERR_CNT(corr3); //RANK 6
-					curr7 = RANK_ODD_ERR_CNT(corr3);  //RANK 7
+				/* Get a CPU/core from the socket where the IMC channel is located*/
+				cpu = (cpus_per_core * (sbridge_dev -> source_id));
 
 
-					sbridge_printk(KERN_DEBUG, "Current CE Errors Rank0=%u Rank1=%u Rank2=%u Rank3=%u Rank4=%u Rank5=%u Rank6=%u Rank7=%u\n",
-								   curr0, curr1,curr2,curr3,curr4,curr5,curr6,curr7);
+				// We are running on E7/E5 v4
+				// Read from HA MSRs MCi_ADDR and MCi_MISC. We ignore MCi_STATUS as the status seems to be always 0 (error cloaking?).
 
-					//Calculate the difference => Number of corrected errors in each rank since last polling interval
-					new0 = curr0 - pvt_info->channel[ch].prev0;
-					new1 = curr1 - pvt_info->channel[ch].prev1;
-					new2 = curr2 - pvt_info->channel[ch].prev2;
-					new3 = curr3 - pvt_info->channel[ch].prev3;
-					new4 = curr4 - pvt_info->channel[ch].prev4;
-					new5 = curr5 - pvt_info->channel[ch].prev5;
-					new6 = curr6 - pvt_info->channel[ch].prev6;
-					new7 = curr7 - pvt_info->channel[ch].prev7;
-
-					sbridge_printk(KERN_DEBUG, "before adjusting CE Errors Rank0=%u Rank1=%u Rank2=%u Rank3=%u Rank4=%u Rank5=%u Rank6=%u Rank7=%u\n",
-								   new0, new1,new2,new3,new4,new5,new6,new7);
-
-					//Adjust the new corrected counter value if the difference is negative => counter over-flow
-					//Even though we use unsigned integers, counters are 15 bit values, therefore below special handling is required.
-					if (new0 < 0)
-						new0 = (counter_threshold - pvt_info->channel[ch].prev0) + curr0;
-					if (new1 < 0)
-						new1 = (counter_threshold - pvt_info->channel[ch].prev1) + curr1;
-					if (new2 < 0)
-						new2 = (counter_threshold - pvt_info->channel[ch].prev2) + curr2;
-					if (new3 < 0)
-						new3 = (counter_threshold - pvt_info->channel[ch].prev3) + curr3;
-					if (new4 < 0)
-						new4 = (counter_threshold - pvt_info->channel[ch].prev4) + curr4;
-					if (new5 < 0)
-						new5 = (counter_threshold - pvt_info->channel[ch].prev5) + curr5;
-					if (new6 < 0)
-						new6 = (counter_threshold - pvt_info->channel[ch].prev6) + curr6;
-					if (new7 < 0)
-						new7 = (counter_threshold - pvt_info->channel[ch].prev7) + curr7;
-
-
-					sbridge_printk(KERN_DEBUG, " after adjusting CE Errors Rank0=%u Rank1=%u Rank2=%u Rank3=%u Rank4=%u Rank5=%u Rank6=%u Rank7=%u\n",
-								   new0, new1,new2,new3,new4,new5,new6,new7);
-
-					// Write to SYSLOG only if any one of the Rank counters has non-zero value.
-					// PCI Bus, Device, Function on which the CE Errors are counted shall be written to SYSLOG.
-					if (  new0 != 0 || new1 != 0 || new2 != 0 || new3 != 0 || new4 != 0 || new5 != 0 || new6 != 0 || new7 != 0){
-
-						// Read the MSRs depending on the TYPE of the processor.
-						// For Broadwell, as per SDM Volume 3B and as inferred on the servers, Home Agent contains the error address.
-
-						sbridge_printk(KERN_ALERT, "CE-ERROR: Getting counters for PCI device: %02x:%02d.%d\n",
-								  sbridge_dev->bus,PCI_SLOT(pvt_info->pci_cerr[ch]->devfn),PCI_FUNC(pvt_info->pci_cerr[ch]->devfn));
-						sbridge_printk(KERN_ALERT, "CE-ERROR: Rank0=%u Rank1=%u Rank2=%u Rank3=%u Rank4=%u Rank5=%u Rank6=%u Rank7=%u node: %d source:%d \n",
-									   new0, new1, new2, new3, new4, new5, new6, new7,sbridge_dev -> node_id, sbridge_dev-> source_id);
-
-						/* Get a CPU/core from the socket where the IMC channel is located*/
-						cpu = (cpus_per_core * (sbridge_dev -> source_id));
-						pvt_info -> info.type = BROADWELL;  //turns out that even on E5 E3 this code is sufficient. THerefore hardcoding this to BROADWELL
-						if ( pvt_info->info.type == BROADWELL){
-							// We are running on E7/E5 v4
-							// Read from HA MSRs MCi_ADDR and MCi_MISC. We ignore MCi_STATUS as the status seems to be always 0 for some reason.
-
-							// Get HA0 ADDR and STATUS
-							if(pvt_info->sbridge_dev->dom == IMC0){
-								msr_status=0;
-								err = rdmsrl_on_cpu(cpu, 0x41D, &msr_status);
-								if (err) {
-								   sbridge_printk(KERN_ERR, "error reading HWCR 0x41D on cpu %d\n", cpu);
-								   return err;
-								}
-
-								msr_addr=0;
-								err = rdmsrl_on_cpu(cpu, 0x41E, &msr_addr);
-								if (err) {
-								  sbridge_printk(KERN_ERR, "error reading HWCR 0x41E on cpu %d\n", cpu);
-								  return err;
-								}
-							}
-							else {
-								// Get HA1 ADDR and STATUS
-								msr_status=0;
-								err = rdmsrl_on_cpu(cpu, 0x421, &msr_status);
-								if (err) {
-								   sbridge_printk(KERN_ERR, "error reading HWCR 0x421 on cpu %d\n", cpu);
-								   return err;
-								}
-
-								msr_addr=0;
-								err = rdmsrl_on_cpu(cpu, 0x422, &msr_addr);
-									if (err) {
-									sbridge_printk(KERN_ERR, "error reading HWCR 0x42 on cpu %d\n", cpu);
-									return err;
-								}
-							}
-							sbridge_printk(KERN_ALERT, "CE-ERROR: status and address registers of cpu=%d source_id=%d, HA=%d, MCi_STATUS=%lld 0x%llx, MCi_ADDR=%lld 0x%llx \n",
-												cpu, sbridge_dev -> source_id, pvt_info->sbridge_dev->dom,  msr_status,msr_status,msr_addr, msr_addr);
-
-						}
-						/*else {
-							// We are running on  E5 V3/HASWELL
-							// Don't clear IMC registers, uncorrected errors are also logged in the same set of registers.
-							// Not a good idea to clear them without checking the corresponding status register for the "type of the error"
-
-
-							// As observed on SERVERS:
-							// Max 2 MCs per socket. When this is the case, each socket would be mapped to MCA registers described in imc_msr_* array.
-							// Mapping would start from the MCA register at the 0th index to Socket 0, IMC-0 and so on.
-
-							mc_index = (pvt_info->sbridge_dev->source_id) * mc_per_socket; // index to array of MCi_ADDR registers.
-
-							// Need to check array out of bound. When Source_id is greater than 3 i.e. when there are more than 4 sockets.
-
-							if(pvt_info->sbridge_dev->dom == IMC1){
-								mc_index = mc_index + 1;
-							}
-
-							// Use mc_index to READ from the MCi_ADDR register that belongs to the IMC on which error was observed.
-							msr_addr=0;
-							err = rdmsrl_on_cpu(cpu, imc_msr_addr[mc_index], &msr_addr);
-							if (err) {
-								sbridge_printk(KERN_ERR, "error reading HWCR %0xllx on cpu %d\n", imc_msr_addr[mc_index], cpu);
-								return err;
-							}
-							sbridge_printk(KERN_ALERT, "CE-ERROR: status and address registers of cpu=%d HA=%d, IMC=0x%llx MCi_STATUS=%lld 0x%llx, MCi_ADDR=%lld 0x%llx\n",
-												   cpu, pvt_info->sbridge_dev->dom, imc_msr_addr[mc_index], msr_status, msr_status , msr_addr, msr_addr);
-						}*/
+				// Get HA0 ADDR and STATUS
+				if(pvt_info->sbridge_dev->dom == IMC0){
+					msr_status=0;
+					err = rdmsrl_on_cpu(cpu, 0x41D, &msr_status);
+					if (err) {
+					   sbridge_printk(KERN_ERR, "error reading HWCR 0x41D on cpu %d\n", cpu);
+					   return err;
 					}
 
-					pvt_info->channel[ch].prev0 = curr0;
-					pvt_info->channel[ch].prev1 = curr1;
-					pvt_info->channel[ch].prev2 = curr2;
-					pvt_info->channel[ch].prev3 = curr3;
-					pvt_info->channel[ch].prev4 = curr4;
-					pvt_info->channel[ch].prev5 = curr5;
-					pvt_info->channel[ch].prev6 = curr6;
-					pvt_info->channel[ch].prev7 = curr7;
-			}
-		} //End of for
-	} // End of parsing the sbridge_dev list
-    msleep(sleep_ms);
-  }
+					msr_addr=0;
+					err = rdmsrl_on_cpu(cpu, 0x41E, &msr_addr);
+					if (err) {
+					  sbridge_printk(KERN_ERR, "error reading HWCR 0x41E on cpu %d\n", cpu);
+					  return err;
+					}
+				}
+				else {
+					// Get HA1 ADDR and STATUS
+					msr_status=0;
+					err = rdmsrl_on_cpu(cpu, 0x421, &msr_status);
+					if (err) {
+					   sbridge_printk(KERN_ERR, "error reading HWCR 0x421 on cpu %d\n", cpu);
+					   return err;
+					}
 
+					msr_addr=0;
+					err = rdmsrl_on_cpu(cpu, 0x422, &msr_addr);
+						if (err) {
+						sbridge_printk(KERN_ERR, "error reading HWCR 0x42 on cpu %d\n", cpu);
+						return err;
+					}
+				}
+
+				sbridge_printk(KERN_ALERT, "CE-ERROR: PCI_device=%02x:%02d.%d cpu=%d source_id=%d, HA=%d, MCi_STATUS=%lld 0x%llx, MCi_ADDR=%lld 0x%llx PFN_to_Page=%lld Rank0=%u Rank1=%u Rank2=%u Rank3=%u Rank4=%u Rank5=%u Rank6=%u Rank7=%u node=%d source=%d\n",
+								sbridge_dev->bus, PCI_SLOT(pvt_info->pci_cerr[ch]->devfn), PCI_FUNC(pvt_info->pci_cerr[ch]->devfn),
+								cpu, sbridge_dev->source_id, pvt_info->sbridge_dev->dom,
+								msr_status, msr_status, msr_addr, msr_addr, pfn_to_page((msr_addr >> PAGE_SHIFT)),
+								new_err[0], new_err[1], new_err[2], new_err[3], new_err[4], new_err[5], new_err[6], new_err[7],
+								sbridge_dev->node_id, sbridge_dev->source_id);
+
+                // Update previous error counts
+                memcpy(pvt_info->channel[ch].prev_err, curr_err, sizeof(curr_err));
+            }
+        }
+        msleep(sleep_ms);
+    }
     return 0;
 }
+
+// Function to read MSR status
+static int read_msr_status(int cpu, u64 *msr_status, u64 *msr_addr) {
+    int err;
+
+    // Logic to read MSR status and address
+    // Update msr_status and msr_addr accordingly
+    // Example: err = rdmsrl_on_cpu(cpu, MSR_ADDRESS, msr_status);
+
+    return err;
+}
+
 
 /****************************************************************************
 			Error check routines
@@ -3905,6 +3806,5 @@ MODULE_PARM_DESC(edac_op_state, "EDAC Error Reporting state: 0=Poll,1=NMI");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mauro Carvalho Chehab");
 MODULE_AUTHOR("Red Hat Inc. (http://www.redhat.com)");
-MODULE_AUTHOR("Shrikanth Malavalli Divakar, SAP SE");
-MODULE_DESCRIPTION("MC Driver for Intel Sandy Bridge and Ivy Bridge memory controllers"
+MODULE_DESCRIPTION("MC Driver for Intel Sandy Bridge and Ivy Bridge memory controllers - SAP CEREBRO"
 		   SBRIDGE_REVISION);
